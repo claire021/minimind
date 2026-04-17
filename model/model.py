@@ -71,3 +71,26 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+import torch
+import torch.nn as nn
+
+# 继承nn.Model类
+class RMSNorm(nn.Module):
+    # __init__初始化
+    def __init__(self, dim:int, eps:float=1e-6):
+        super().__init__()
+        self.dim = dim #纬度
+        self.eps = eps 
+        self.weight = nn.Parameter(torch.ones(dim)) # 初始化张量
+
+    #__norm
+    def _norm(self, x):
+        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
+        
+    # forward方法
+    def forward(self, x):
+        return self.weight * self._norm(x.float()).typed_as(x) * x
+
+
+
+
