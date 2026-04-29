@@ -241,4 +241,74 @@ class Attention(nn.Module):
         bsz, seq_len, _ = x.shape
 
         # 线性投影为Q，K，V
+        # q_proj: hidden -> num_heads * head_dim
+        # k_proj/v_proj: hidden -> num_kv_heads * head_dim(GQA情形)
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        # 将投影结果reshape成多头格式
+        # q：[bsz, seq_len, num_heads, head_dim]
+        # k/v: [bsz, seq_len, n_local_kv_heads, head_dim]
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        # position_embeddings是预计算的（cos，sin），按序列位置切片并应用RoPE
+        cos, sin = position_embeddings
+        # 只取当前序列长度的前缀
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+
+        # -------------------- KV cache 处理 --------------------
+        # past_key_value: (past_k, past_v) 或 None
+        # 当存在past时，将past拼接到当前k,v的时间维度上，便于自回归推理
+        if past_key_value is not None:
+            # past_key_value[0] 的shape为 [bsz, past_seq_len, n_local_kv_heads, head_dim]
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+
+        # 如果需要缓存，返回拼接后的(k,v)，否则past_kv置为None
+        past_kv = (xk, xv) if use_cache else None
+
+        # -------------------- GQA: 对KV重复以匹配Q头 --------------------
+        # transpose到形状 [bsz, n_heads, seq_len, head_dim] 以便矩阵乘法
+        xq = xq.transpose(1, 2)
+        # repeat_kv会把k/v的头数从 n_local_kv_heads -> n_local_kv_heads * n_rep (即等于n_local_heads)
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
+        
+        # -------------------- Attention计算 --------------------
+        # 优先使用PyTorch 2.0+的scaled_dot_product_attention（Flash Attention实现）
+        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+            # 如果没有显式的attention_mask，直接传None让底层高效实现
+            attn_mask = None if attention_mask is None else attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1).bool()
+            # F.scaled_dot_product_attention是PyTorch在新版本中提供的高效实现
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True # 自回归（因果）注意力
+            )
+        else:
+            # 标准实现：scores = Q @ K^T / sqrt(d)
+            scores = (xq @ xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
+
+            # causal mask: 上三角（对角线以上）置为 -inf，防止看到未来信息
+            causal_mask = torch.tril(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
+            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0) # 扩展batch和head维度
+
+            # 如果有attention_mask(0/1)，将其扩展后转为 -1e9 的加性mask（掩掉pad位置）
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            # softmax得到注意力权重
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            # 加权求和得到输出
+            output = scores @ xv
+
+        # 恢复形状并做输出投影 + 残差dropout
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)  # [bsz, seq_len, hidden]
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
     
