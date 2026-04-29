@@ -236,11 +236,30 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache = False,
                 attention_mask: Optional[torch.Tensor] = None):
-        
+        """_summary_
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            [batch, seq_len, hidden_size]
+        position_embeddings : Tuple[Tuple[torch.Tensor, torch.Tensor]]
+            预计算的RoPE位置编码的cos和sin
+        use_cache : bool, optional
+            是否缓存当前K/V
+        attention_mask : Optional[torch.Tensor], optional
+            用于屏蔽padding位置
+
+        Returns
+        -------
+        _type_
+            output, past_kv
+        """
+        # 输入x
         # x:[batch_size, seq_len, hidden]
         bsz, seq_len, _ = x.shape
 
-        # 线性投影为Q，K，V
+        # ------------------ 线性投影 + 多头reshape------------------
+        # 线性投影 Q，K，V
         # q_proj: hidden -> num_heads * head_dim
         # k_proj/v_proj: hidden -> num_kv_heads * head_dim(GQA情形)
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -252,7 +271,9 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
+        # -------------------- RoPE 处理 --------------------
         # position_embeddings是预计算的（cos，sin），按序列位置切片并应用RoPE
+        # 比如 [max_seq_len=2048, 64]
         cos, sin = position_embeddings
         # 只取当前序列长度的前缀
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
@@ -266,21 +287,25 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
 
         # 如果需要缓存，返回拼接后的(k,v)，否则past_kv置为None
+        # 有缓存：只算新token的K/V → O(n)
+        # 无缓存：算所有token的K/V → O(n^2)
         past_kv = (xk, xv) if use_cache else None
 
         # -------------------- GQA: 对KV重复以匹配Q头 --------------------
-        # transpose到形状 [bsz, n_heads, seq_len, head_dim] 以便矩阵乘法
+        # 转置: [batch, seq, heads, dim] -> [batch, heads, seq, dim] 以便矩阵乘法
         xq = xq.transpose(1, 2)
+
         # repeat_kv会把k/v的头数从 n_local_kv_heads -> n_local_kv_heads * n_rep (即等于n_local_heads)
-        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
-        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2) # [2, 2, 4, 64] -> [2, 8, 4, 64]
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2) 
         
         # -------------------- Attention计算 --------------------
         # 优先使用PyTorch 2.0+的scaled_dot_product_attention（Flash Attention实现）
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             # 如果没有显式的attention_mask，直接传None让底层高效实现
             attn_mask = None if attention_mask is None else attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1).bool()
-            # F.scaled_dot_product_attention是PyTorch在新版本中提供的高效实现
+            # F.scaled_dot_product_attention是PyTorch在新版本中提供的高效实现 内存复杂度 O(N)
+            # is_causal=True: 自动创建因果mask（上三角为-inf）
             output = F.scaled_dot_product_attention(
                 xq, xk, xv,
                 attn_mask=attn_mask,
@@ -289,12 +314,15 @@ class Attention(nn.Module):
             )
         else:
             # 标准实现：scores = Q @ K^T / sqrt(d)
+            # Step 1: 计算注意力分数
             scores = (xq @ xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
 
-            # causal mask: 上三角（对角线以上）置为 -inf，防止看到未来信息
+            # Step 2: 因果mask（不让当前位置看到未来）
+            # causal mask: 上三角（对角线以上）置为 -inf
             causal_mask = torch.tril(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
             scores = scores + causal_mask.unsqueeze(0).unsqueeze(0) # 扩展batch和head维度
 
+            # Step 3: Padding mask
             # 如果有attention_mask(0/1)，将其扩展后转为 -1e9 的加性mask（掩掉pad位置）
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
@@ -302,13 +330,14 @@ class Attention(nn.Module):
                 scores = scores + extended_attention_mask
 
             # softmax得到注意力权重
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq) # 在最后一维做softmax，即每一行
             scores = self.attn_dropout(scores)
             # 加权求和得到输出
             output = scores @ xv
 
         # 恢复形状并做输出投影 + 残差dropout
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)  # [bsz, seq_len, hidden]
+        # # [batch, heads, seq_len, head_dim] ->[batch, seq_len, heads, head_dim] -> [batch, seq_len, hidden]
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)  # -1 表示自动计算: heads * head_dim = 8 * 64 = 512
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
     
