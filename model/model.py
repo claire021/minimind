@@ -73,6 +73,9 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import math
+from typing import Optional, Tuple
+from torch.nn import functional as F
 
 # 继承nn.Model类
 class RMSNorm(nn.Module):
@@ -94,18 +97,20 @@ class RMSNorm(nn.Module):
 def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Optional[dict]=None):
     # 初始化RoPE频率
     freqs, attn_factor = (1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0)
+    
 
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow = (
-            rope_scaling["original_max_position_embeddings"], 
-            rope_scaling["factor"], 
-            rope_scaling["beta_fast"], 
-            rope_scaling["beta_slow"]
+            rope_scaling["original_max_position_embeddings"], # 模型原本能承受的极限（“舒适区”）
+            rope_scaling["factor"],  # 我们要把上下文扩展到原来的多少倍（128K / 32K = 4）
+            rope_scaling["beta_fast"],  # 那些“波长”小于 beta_fast 的维度我们认为它是“高速转盘”，坚决不能动
+            rope_scaling["beta_slow"],  # 多慢的齿轮我们认为它是“低速转盘”，可以减速
         )
 
         # 推断的长度大于训练长度，用缩放
         if end > orig_max:
             # 波长b到i的映射
+            # “波长” = “转一整圈需要的 Token 数量”
             inv_dim = lambda b: (dim * math.log(orig_max / (b*2*math.pi)))/(2*math.log(rope_base))
 
             #划分高低维度
@@ -153,4 +158,87 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids = None, unsqueeze_dim = 1)
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
 
+# 把 key/value 头复制多份
+# num_key_value_heads  →  num_key_value_heads * n_rep
+def repeat_kv(x:torch.Tensor, n_rep:int) -> torch.Tensor:
+    """
+    重复key-value张量以匹配query头数 (用于分组查询注意力GQA)
+    等价于torch.repeat_interleave(x, dim=2, repeats=n_rep)，但更高效
+    
+    在GQA中，key和value的头数少于query，需要重复来匹配
+    例如：8个query头，2个kv头，则需要每个kv头重复4次
+    
+    Args:
+        x: kv张量 [batch, seq_len, num_kv_heads, head_dim]
+        n_rep: 重复次数
+    
+    Returns:
+        重复后的张量 [batch, seq_len, num_kv_heads * n_rep, head_dim]
+    """
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x # 无需重复直接返回
+    
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
 
+
+class Attention(nn.Module):
+    """
+    多头自注意力机制，支持分组查询注意力(GQA)和Flash Attention优化
+    
+    GQA介绍：
+    - 传统MHA：query、key、value头数相同
+    - GQA：key、value头数少于query头数，通过重复匹配
+    - 优点：减少KV cache内存占用，保持性能
+    """
+    def __init__(self, args:MokioMindConfig):
+        super().__init__()
+
+        # 处理GQA： 如没有指定kv头数，则使用与query相同的头数
+        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+
+        # GQA 的核心思想是：将 num_attention_heads 个 Query 头分组，每一组共享一个 KV 头。
+        # 这就意味着 num_attention_heads / num_key_value_heads 必须是一个整数，这个整数=n_rep（每个 KV 头需要复制的次数）
+        assert args.num_attention_heads % self.num_key_value_heads == 0,
+        "num_attention_heads must be divisible by num_key_value_heads"
+
+        # 设置注意力头配置
+        self.n_local_heads = args.num_attention_heads                 # query头
+        self.n_local_kv_heads = self.num_key_value_heads              # kv头
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads      # 每个kv头需要复制的次数
+        self.head_dim = args.hidden_size // args.num_attention_heads  # 每个头的维度
+
+        # 定义线性投影层 (无偏置，节省参数)
+        # nn.Linear(in_features, out_features, bias=False)
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)     # Query投影
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)     # Key投影
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)     # Value投影
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)     # 输出投影
+        
+        # Dropout层用于正则化
+        self.attn_dropout = nn.Dropout(args.dropout)    # 注意力权重dropout
+        self.resid_dropout = nn.Dropout(args.dropout)   # 残差连接dropout
+        self.dropout = args.dropout                      # 保存dropout率
+        
+        # 检查是否支持Flash Attention
+        # hasattr(obj, 'attr'): 检查对象是否有指定属性
+        # Flash Attention需要PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        # 如果不支持可以打印警告: print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+
+    def forward(self,
+                x: torch.Tensor,
+                position_embeddings: Tuple[Tuple[torch.Tensor, torch.Tensor]], #修改为接收cos和sin
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache = False,
+                attention_mask: Optional[torch.Tensor] = None):
+        
+        # x:[batch_size, seq_len, hidden]
+        bsz, seq_len, _ = x.shape
+
+        # 线性投影为Q，K，V
+    
