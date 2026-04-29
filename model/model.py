@@ -363,9 +363,93 @@ class FeedForward(nn.Module):
         
     def forward(self, x):
         """
+        升维→非线性→降维
         forward实现使用SwiGLU风格的门控激活：
         output = down_proj( act_fn(gate_proj(x)) * up_proj(x) )
         并在输出前应用dropout
         """
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
+    
+
+# 按照架构图将前面的内容拼接
+class MokioMindBlock(nn.Module):
+    """
+    输入 hidden_states
+    |
+    ├─────────────────┐ (残差路径1)
+    |                 |
+    |   input_layernorm (RMSNorm)
+    |         |
+    |    self_attn (多头注意力)
+    |         |
+    └────────→ (+) 相加
+              |
+              ├─────────────────┐ (残差路径2)
+              |                 |
+              | post_attention_layernorm
+              |         |
+              |      mlp (FFN)
+              |         |
+              └────────→ (+) 相加
+                        |
+                    输出
+    """
+    def __init__(self, layer_id: int, config: MokioMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(config) # 创建注意力层
+
+        self.layer_id = layer_id # 记录这是第几层（用于调试和位置编码）
+        # 两个RMSNorm层（Pre-Norm模式
+        self.input_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        # 前馈网络（支持MoE或普通FFN）
+        self.mlp = FeedForward(config) 
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        """_summary_
+
+        Parameters
+        ----------
+        hidden_states : _type_
+            输入: [batch, seq_len, hidden_size]
+        position_embeddings : _type_
+            RoPE位置编码 (cos, sin)
+        past_key_value : _type_, optional
+            KV缓存 (推理时用)
+        use_cache : bool, optional
+            是否缓存
+        attention_mask : _type_, optional
+            注意力掩码 (padding等)
+
+        Returns
+        -------
+        _type_
+            hidden_states, present_key_value
+        """
+        # 残差连接模式：先做LayerNorm -> Attention -> 残差相加 -> LayerNorm -> FFN -> 残差相加
+        # Step 1: 保存原始输入（残差路径）
+        residual = hidden_states
+
+        # 注意力子层：输入先归一化（RMSNorm），返回hidden_states和present_key_value（用于cache）
+        hidden_states, present_key_value = self.self_attn(
+            # Step 2: 处理输入（变换路径）
+            # 在注意力之前归一化pre-norm
+            self.input_layernorm(hidden_states), 
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask
+        )
+
+        # Step 3: 残差相加（原始 + 变换）
+        # 注意力输出与残差相加
+        hidden_states = residual + hidden_states
+
+        # Step 4: 重复上述过程
+        # 前馈子层（post-attention layernorm）并相加
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states)) # 在FFN之前归一化
+        return hidden_states, present_key_value
