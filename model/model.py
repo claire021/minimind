@@ -1,4 +1,6 @@
 from transformers import PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from torch.nn import init
 
 # Huggingface的一个配置类，用于存储模型的超参数和配置选项。它继承自PretrainedConfig，并定义了MokioMind模型的特定配置选项。
 class MokioMindConfig(PretrainedConfig):
@@ -74,89 +76,138 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 from torch.nn import functional as F
-from .activation_functions import ACT2FN
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutput
+from transformers import PreTrainedModel, GenerationMixin
 
-# 继承nn.Model类
-class RMSNorm(nn.Module):
-    # __init__初始化
-    def __init__(self, dim:int, eps:float=1e-6):
-        super().__init__()
-        self.dim = dim #纬度
-        self.eps = eps 
-        self.weight = nn.Parameter(torch.ones(dim)) # 初始化张量
 
-    #__norm
+class RMSNorm(torch.nn.Module):
+    """
+    RMS归一化 (Root Mean Square Normalization)
+    相比LayerNorm，RMSNorm去掉了均值中心化，只保留方差缩放
+    计算更简单，效果相当，在大模型中广泛使用
+    """
+    def __init__(self, dim: int, eps: float = 1e-5):
+        """
+        Args:
+            dim: 归一化的维度大小
+            eps: 防止除零的小常数
+        """
+        super().__init__()                              # 调用父类nn.Module的构造函数
+        self.eps = eps                                  # 存储epsilon值
+        # nn.Parameter: 将tensor注册为可学习参数，会自动加入optimizer
+        # torch.ones(dim): 创建全1的tensor作为缩放参数
+        self.weight = nn.Parameter(torch.ones(dim))
+
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
-        
-    # forward方法
+        """
+        RMSNorm的核心计算：x / sqrt(mean(x^2) + eps)
+        """
+        # x.pow(2): 对x每个元素平方
+        # .mean(-1, keepdim=True): 在最后一维求均值，保持维度
+        # torch.rsqrt(): 计算平方根的倒数，即 1/sqrt(x)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
     def forward(self, x):
-        return self.weight * self._norm(x.float()).typed_as(x) * x
+        """
+        前向传播
+        Args:
+            x: 输入tensor，shape为[batch, seq_len, dim]
+        Returns:
+            归一化后的tensor
+        """
+        # .float(): 转换为float32进行计算，提高数值稳定性
+        # .type_as(x): 将结果转换回x的原始数据类型
+        # self.weight *: 可学习的缩放参数
+        return self.weight * self._norm(x.float()).type_as(x)
     
-def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Optional[dict]=None):
-    # 初始化RoPE频率
-    freqs, attn_factor = (1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0)
-    
+def precompute_freqs(
+    dim: int,
+    end: int = 32 * 1024,
+    rope_base: float = 1e6,
+    rope_scaling: Optional[dict] = None,
+):
+    # 1. 初始化标准 RoPE 频率。
+    # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
+    # 计算出的 freqs 就是标准的 1 / (base ** (2i / d))
+    freqs, attn_factor = (
+        1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)),
+        1.0,
+    )
 
     if rope_scaling is not None:
-        orig_max, factor, beta_fast, beta_slow = (
-            rope_scaling["original_max_position_embeddings"], # 模型原本能承受的极限（“舒适区”）
-            rope_scaling["factor"],  # 我们要把上下文扩展到原来的多少倍（128K / 32K = 4）
-            rope_scaling["beta_fast"],  # 那些“波长”小于 beta_fast 的维度我们认为它是“高速转盘”，坚决不能动
-            rope_scaling["beta_slow"],  # 多慢的齿轮我们认为它是“低速转盘”，可以减速
+        # 2. 从配置字典中提取 YaRN 的超参数
+        # orig_max: 模型预训练时的原始最大长度（例如 Llama-2 是 2048 或 4096）
+        # factor: 要扩展的倍数 s (比如从 2k 扩展到 32k，factor 就是 16)
+        # beta_fast (对应论文中的 α): 高频边界，波长比例大于此值的维度不缩放
+        # beta_slow (对应论文中的 β): 低频边界，波长比例小于此值的维度全量缩放
+        # attn_factor: 注意力温度补偿，由于距离拉长导致注意力分布发散（变平缓），需要乘上一个系数让注意力重新“聚焦”
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0),
+            rope_scaling.get("beta_slow", 1.0),
+            rope_scaling.get("attention_factor", 1.0),
         )
 
-        # 推断的长度大于训练长度，用缩放
-        if end > orig_max:
-            # 波长b到i的映射
-            # “波长” = “转一整圈需要的 Token 数量”
-            inv_dim = lambda b: (dim * math.log(orig_max / (b*2*math.pi)))/(2*math.log(rope_base))
+        # 只有当要推断的长度大于原始训练长度时，才应用缩放
+        if end / orig_max > 1.0:
+            # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (
+                2 * math.log(rope_base)
+            )
 
-            #划分高低维度
-            #low： 不需要缩放的高频部分
-            # high： 需要缩放的低频部分
-            low, high = (max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2))
+            # 4. 计算高频区和低频区的维度切分点
+            # low: 不需要缩放的高频部分的最高索引
+            # high: 需要完全缩放的低频部分的最低索引
+            low, high = (
+                max(math.floor(inv_dim(beta_fast)), 0),
+                min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1),
+            )
 
-            # 计算缩放因子
-            # low之前，ramp为0，high之后，ramp为1，中间线性过度
+            # 5. 计算混合因子 γ (Ramp)
+            # 在 low 之前，ramp 为 0；在 high 之后，ramp 为 1；在 low 和 high 之间，线性过渡。
+            # clamp 函数限制了数值只能在 [0, 1] 之间。
             ramp = torch.clamp(
-                (torch.arange(dim//2, device=freqs.device).float() - low) / max(high - low, 0.001),
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 0.001),
                 0,
                 1,
             )
-            # 当 ramp = 0 时（高频），系数为1，保持频率不变
-            # 当 ramp = 1 时（低频），系数为 1/factor，频率进行线性插值缩放
-            # ramp在0和1之间时，平滑过渡
-            freqs = freqs * (1 - ramp + ramp * factor)
 
-        # 根据end， 生成位置索引t
-        t = torch.arange(end, device=freqs.device).float()
+            # 6. 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
+            # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
+            # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
+            # ramp在0-1之间时：平滑过渡。
+            freqs = freqs * (1 - ramp + ramp / factor)
 
-        
-        # 计算外积， t和频率部分相乘， 得到每个位置的旋转角度
-        freqs = torch.outer(t, freqs).float()
-        freqs_cos = (
-            torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-        )
-        freqs_sin = (
-            torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
-        )
-        return freqs_cos, freqs_sin
-    
-# 编写RoPE
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids = None, unsqueeze_dim = 1):
-    # [a,b] -> [-b,a]
+    # 7. 根据目标长度 end，生成位置索引向量 t
+    t = torch.arange(end, device=freqs.device)
+
+    # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
+    freqs = torch.outer(t, freqs).float()
+
+    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+
+    return freqs_cos, freqs_sin
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotate_half(x):
-        # x.shape[-1]取最后一个维度的重点
-        # x[..., x.shape[-1] // 2 :]：取最后一半的维度
         return torch.cat(
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
         )
-    # x_rotated = x * cos + rotate_half(x) * sin
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
-    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
     return q_embed, k_embed
 
 # 把 key/value 头复制多份
@@ -200,19 +251,19 @@ class Attention(nn.Module):
         super().__init__()
 
         # 处理GQA： 如没有指定kv头数，则使用与query相同的头数
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is not None else args.num_key_value_heads
 
         # GQA 的核心思想是：将 num_attention_heads 个 Query 头分组，每一组共享一个 KV 头。
         # 这就意味着 num_attention_heads / num_key_value_heads 必须是一个整数，这个整数=n_rep（每个 KV 头需要复制的次数）
-        assert args.num_attention_heads % self.num_key_value_heads == 0,
+        assert args.num_attention_heads % self.num_key_value_heads == 0
         "num_attention_heads must be divisible by num_key_value_heads"
 
         # 设置注意力头配置
-        self.n_local_heads = args.num_attention_heads                 # query头
-        self.n_local_kv_heads = self.num_key_value_heads              # kv头
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads      # 每个kv头需要复制的次数
+        self.n_local_heads = args.num_attention_heads          # query头数
+        self.n_local_kv_heads = self.num_key_value_heads       # key-value头数
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads  # 每个kv头需要重复的次数
         self.head_dim = args.hidden_size // args.num_attention_heads  # 每个头的维度
-
+        
         # 定义线性投影层 (无偏置，节省参数)
         # nn.Linear(in_features, out_features, bias=False)
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)     # Query投影
@@ -228,7 +279,7 @@ class Attention(nn.Module):
         # 检查是否支持Flash Attention
         # hasattr(obj, 'attr'): 检查对象是否有指定属性
         # Flash Attention需要PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
         # 如果不支持可以打印警告: print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self,
@@ -371,6 +422,169 @@ class FeedForward(nn.Module):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
     
+class MoEGate(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                ).div_(seq_len * aux_topk / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                ce = mask_ce.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
+    
+class MoEFeedForward(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        # 专家层
+        self.experts = nn.ModuleList(
+            [FeedForward(config) for _ in range(config.n_routed_experts)]
+        )
+        # 门控层
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
+            )
+
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, h = orig_shape
+
+        # 使用门控机制选择专家
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        # 展开x以便处理
+        x = x.view(-1, x.shape[-1])
+
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            # 按照定义的num_experts_per_tok重复输入token
+            # 每个token安排num_experts_per_tok个专家处理
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # y是空张量，和x形状相同
+            y = torch.empty_like(x, dtype=x.dtype)
+            # 遍历所有专家
+            for i, expert in enumerate(self.experts):
+                # 找到所有指向专家i的token
+                # 然后将这些token输入专家i进行处理
+                # 最后将结果放回y对应位置
+                expert_out = expert(x[flat_topk_idx == i])
+                if expert_out.shape[0] > 0:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                else:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
+            # 加权求和
+            # 最后的y意义是每个token经过专家处理后的加权结果
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        # 如果是推理阶段
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    # MoE推理方法
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 使用cache，创建一个和x形状相同的零张量
+        expert_cache = torch.zeros_like(x)
+        # 对专家索引进行排序，最后是[0,0,0,1,1,2,2,2,...]这样的顺序
+        # 分拣
+        idxs = flat_expert_indices.argsort()
+        # 统计每个专家被分配到的token数量
+        # 打包
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 计算每个token对应的专家索引
+        token_idxs = idxs // self.config.num_experts_per_tok
+        # 对每个打包好的包进行处理
+        for i, end_idx in enumerate(tokens_per_expert):
+            # 计算当前包的起始位置
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            # 取出当前包对应的专家
+            expert = self.experts[i]
+            # 取出token对应的原始id
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 取出token对应的数据
+            expert_tokens = x[exp_token_idx]
+            # 计算专家输出，一次性处理当前包的所有token
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 加权
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将结果散点加到缓存中对应位置
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+
+        return expert_cache
+    
 
 # 按照架构图将前面的内容拼接
 class MokioMindBlock(nn.Module):
@@ -407,7 +621,12 @@ class MokioMindBlock(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
         # 前馈网络（支持MoE或普通FFN）
-        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.mlp = (
+            FeedForward(config)
+            if not config.use_moe
+            else MoEFeedForward(config)  
+        )
+
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         """_summary_
@@ -453,9 +672,10 @@ class MokioMindBlock(nn.Module):
         # 前馈子层（post-attention layernorm）并相加
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states)) # 在FFN之前归一化
         return hidden_states, present_key_value
+    
 
-class MiniMindModel(nn.Model):
-    def __init_(self, config: MokioMindConfig):
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MokioMindConfig):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
@@ -464,7 +684,7 @@ class MiniMindModel(nn.Model):
         self.layers = nn.ModuleList([MokioMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
 
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim = config.hidden_size // config.num_attention_heads,
+        freqs_cos, freqs_sin = precompute_freqs(dim = config.hidden_size // config.num_attention_heads,
                                                     end = config.max_position_embeddings, rope_base = config.rope_theta,
                                                     rope_scaling = config.rope_scaling) 
         self.register_buffer("freqs_cos", freqs_cos, persistent = False)
@@ -503,11 +723,11 @@ class MiniMindModel(nn.Model):
 
         # 逐层前向，通过zip把layer和对应的past_key_value配对
         presents = []
-        for layer_idx, (layer, past_key_values) in enumerate(zip(self.layers, past_key_values)):
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
             hidden_states, present = layer( # MiniMindBlock 实例（Transformer层）
                 hidden_states,
                 position_embeddings,
-                past_key_values = past_key_values,
+                past_key_value = past_key_value,
                 use_cache = use_cache,
                 attention_mask = attention_mask
             )
@@ -520,7 +740,7 @@ class MiniMindModel(nn.Model):
         aux_loss = sum(
             layer.mlp.aux_loss
             for layer in self.layers
-            if isinstance(layer.mlp. MOEFeedForward)
+            if isinstance(layer.mlp, MoEFeedForward)
         )
         return hidden_states, presents, aux_loss
 
@@ -545,7 +765,7 @@ class MokioMindForCausalLM(PreTrainedModel,
     def forward(
             self,
             input_ids: Optional[torch.Tensor] = None, # [batch, seq_len]
-            attention_mask: Optional(torch.Tensor) = None,
+            attention_mask: Optional[torch.Tensor] = None,
             labels: Optional[torch.Tensor] = None, # [batch, seq_len]: 用于计算损失的真实 token ID
             past_key_value: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None, # (K, V)
             use_cache: bool = None,
@@ -592,11 +812,10 @@ class MokioMindForCausalLM(PreTrainedModel,
             # 构造输出对象, 创建HuggingFace标准输出格式
             output = CausalLMOutputWithPast(
                 loss = loss,
-                logits = logitds,
+                logits = logits,
                 past_key_value = past_key_value,
                 hidden_states = hidden_states,
             )
             output.aux_loss = aux_loss
             return output
         
-    )
