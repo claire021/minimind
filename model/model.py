@@ -74,7 +74,7 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from torch.nn import functional as F
 from .activation_functions import ACT2FN
 
@@ -525,3 +525,78 @@ class MiniMindModel(nn.Model):
         return hidden_states, presents, aux_loss
 
 
+class MokioMindForCausalLM(PreTrainedModel,
+                           GenerationMixin):
+    '''
+    PreTrainedModel: HuggingFace 基类，提供保存/加载、配置管理等功能
+    GenerationMixin: HuggingFace 生成混入类，提供 generate() 方法（文本生成）
+    '''
+
+    config_class = MokioMindConfig
+
+    def __init__(self, config: MokioMindConfig): 
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        # 输出形状：[batch_size, seq_len, hidden_size]）
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias = False)
+        # 权重共享（Weight Tying）——让 embedding 层和 lm_head 使用相同的权重矩阵。
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None, # [batch, seq_len]
+            attention_mask: Optional(torch.Tensor) = None,
+            labels: Optional[torch.Tensor] = None, # [batch, seq_len]: 用于计算损失的真实 token ID
+            past_key_value: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None, # (K, V)
+            use_cache: bool = None,
+            #只保留最后几个位置的 logits（节省内存）
+            logits_to_keep: Union[int, torch.Tensor] = 0, # int/Tensor
+            **args # 接收额外参数，传给 self.model
+            ):
+        
+            # 调用主干模型向前传播
+            hidden_states, past_key_value, aux_loss = self.model(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                past_key_values = past_key_value,
+                use_cache = use_cache,
+                **args,
+            )
+
+            # 切片logits（内存优化）
+            # 决定保留哪些位置的 logits
+            # 计算损失时，只需要最后一个位置预测下一个 token
+            slice_indices = (
+                # slice(start, stop) 创建切片对象
+                # 如果 logits_to_keep=1 → slice(-1, None) → 只保留最后一个位置
+                slice(-logits_to_keep, None) 
+                if isinstance(logits_to_keep, int)
+                else logits_to_keep
+            )
+            # 对隐藏状态切片后，通过 lm_head 计算 logits
+            # [batch, kept_len, 512] -> [batch, kept_len, vocab_size]
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            # 计算损失
+            loss = None
+            # 如果提供了标签，就计算交叉熵损失
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous() # 移位操作——去掉 logits 的最后一个位置
+                shift_labels = labels[..., 1:].contiguous() # 去掉 labels 的第一个位置（因为没有对应的 logits 预测它）
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)), # [batch, seq-1, 6400] → [batch*(seq-1), 6400]
+                    shift_labels.view(-1), # [batch, seq-1] → [batch*(seq-1)]
+                    ignore_index = -100, # 跳过标签为 -100 的位置
+                )
+
+            # 构造输出对象, 创建HuggingFace标准输出格式
+            output = CausalLMOutputWithPast(
+                loss = loss,
+                logits = logitds,
+                past_key_value = past_key_value,
+                hidden_states = hidden_states,
+            )
+            output.aux_loss = aux_loss
+            return output
+        
+    )
